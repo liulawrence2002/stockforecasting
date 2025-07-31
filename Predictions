@@ -1,0 +1,1381 @@
+import torch
+import torch.nn.functional as F
+from torch.nn import MultiheadAttention
+from torch_geometric.nn import GATConv
+import pandas as pd
+import numpy as np
+import os # Added for os.path.isfile
+import time
+import datetime
+import pickle
+# import requests # No longer needed for Polygon
+import pytz
+import logging
+import argparse
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional, Any
+from sklearn.preprocessing import StandardScaler
+
+import yfinance as yf # Added for yfinance
+import math           # Added for yfinance
+
+try:
+    import tensorrt as trt
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+    TRT_AVAILABLE = True
+except ImportError:
+    TRT_AVAILABLE = False
+    logging.warning("TensorRT or PyCUDA not found.")
+    class trt:
+        Logger = object
+        Builder = object
+        NetworkDefinitionCreationFlag = object
+        BuilderFlag = object
+        OnnxParser = object
+        Runtime = object
+        def nptype(self, *args): return np.float32
+        def volume(self, *args): return 0
+    class cuda:
+        Stream = object
+        def pagelocked_empty(*args, **kwargs): return np.array([])
+        def mem_alloc(*args, **kwargs): return 0
+        def memcpy_htod_async(*args, **kwargs): pass
+        def memcpy_dtoh_async(*args, **kwargs): pass
+
+try:
+    import torch.onnx
+    import onnx
+    from onnx import helper, TensorProto, shape_inference
+    ONNX_AVAILABLE = True
+except ImportError:
+    ONNX_AVAILABLE = False
+    logging.warning("ONNX libraries not found.")
+
+try:
+    import onnx_graphsurgeon as gs
+    GS_AVAILABLE = True
+    logging.info("ONNX GraphSurgeon found.")
+except ImportError:
+    GS_AVAILABLE = False
+    logging.warning("ONNX GraphSurgeon not found.")
+
+try:
+    import onnxsim
+    SIM_AVAILABLE = True
+    logging.info("ONNX Simplifier found.")
+except ImportError:
+    SIM_AVAILABLE = False
+    logging.warning("ONNX Simplifier not found.")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+parser = argparse.ArgumentParser(description="Real-time GNN Inference with TensorRT")
+parser.add_argument("-t", "--tickers", type=str, required=True, help="Comma-separated list of tickers (e.g., AAPL,MSFT)")
+parser.add_argument("-i", "--interval", type=int, default=1, help="Data aggregation interval value")
+parser.add_argument("-u", "--unit", type=str, default="hour", choices=["minute", "hour"], help="Data aggregation unit")
+parser.add_argument("-m", "--model_dir", type=str, default=None, help="Path to model run directory")
+parser.add_argument("-f", "--force_rebuild", action="store_true", help="Force rebuild of ONNX and TensorRT engine")
+parser.add_argument("--loop_interval_seconds", type=int, default=None, help="Override sleep interval between predictions")
+args = parser.parse_args()
+
+TICKERS_LIST = [t.strip().upper() for t in args.tickers.split(',') if t.strip()]
+TIME_AGGREGATE = str(args.interval)
+TIME_UNIT = args.unit
+MODEL_RUN_DIR = Path(args.model_dir) if args.model_dir else Path("GNNRUNS1/20250511-180718_QuantGNN_Heads1_MeanAggr/final_run")
+FORCE_REBUILD = args.force_rebuild
+
+if not TICKERS_LIST:
+    logging.error("No valid tickers provided.")
+    exit(1)
+if TIME_UNIT == "day": # This check is still useful for early exit
+    logging.error("Real-time inference supports 'minute' or 'hour' units only.")
+    exit(1)
+
+interval_minutes = args.interval if args.unit == "minute" else args.interval * 60
+LOOP_INTERVAL_SECONDS = args.loop_interval_seconds if args.loop_interval_seconds is not None else interval_minutes * 10
+logging.info(f"Main loop interval: {LOOP_INTERVAL_SECONDS} seconds")
+
+SCALER_FILE = next(MODEL_RUN_DIR.glob("scalers_*.pkl"), MODEL_RUN_DIR / "scalers.pkl")
+BEST_PARAMS_FILE = next(MODEL_RUN_DIR.glob("best_params_*.pkl"), MODEL_RUN_DIR / "best_params.pkl")
+MODEL_WEIGHTS_FILE = next(MODEL_RUN_DIR.glob("best_final_model_*.pth"), next(MODEL_RUN_DIR.glob("last_final_model_*.pth"), MODEL_RUN_DIR / "best_final_model.pth"))
+
+ONNX_FILE_PATH = MODEL_RUN_DIR / f"gnn_model_{TIME_AGGREGATE}{TIME_UNIT}_heads1_mean_static.onnx"
+TENSORRT_ENGINE_PATH = MODEL_RUN_DIR / f"gnn_model_{TIME_AGGREGATE}{TIME_UNIT}_heads1_mean_static.engine"
+
+MARKET_TIMEZONE = 'US/Eastern' # Still used for display purposes
+
+SEQ_LEN = 40  # change from 60
+PRED_HORIZON = 2
+FEATURES = ['Open', 'High', 'Low', 'Close', 'Volume']
+TARGET_FEATURE = 'Close'
+CORR_THRESHOLD = 0.7  # change from 0.5
+NUM_QUANTILES = 3
+QUANTILES = [0.1, 0.5, 0.9]
+MEDIAN_Q_IDX = QUANTILES.index(0.5) if 0.5 in QUANTILES else -1
+
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING) if TRT_AVAILABLE else None
+USE_FP16 = False
+NUM_NODES = len(TICKERS_LIST)
+EDGE_FEATURE_DIM = 1
+#MAX_EDGES = NUM_NODES * (NUM_NODES - 1) // 2 if NUM_NODES > 1 else 0
+MAX_EDGES = NUM_NODES * (NUM_NODES - 1) if NUM_NODES > 1 else 0
+def load_scalers(filepath: Path) -> Optional[Dict[str, Dict[str, StandardScaler]]]:
+    if not filepath.exists():
+        logging.error(f"Scaler file not found: {filepath}")
+        return None
+    try:
+        with open(filepath, 'rb') as f:
+            scalers = pickle.load(f)
+        logging.info(f"Loaded scalers for {len(scalers)} tickers from {filepath}")
+        if not isinstance(scalers, dict) or not all(isinstance(v, dict) for v in scalers.values()):
+            logging.error(f"Invalid scaler file format: {filepath}")
+            return None
+        return scalers
+    except Exception as e:
+        logging.error(f"Error loading scalers from {filepath}: {e}")
+        return None
+
+def load_best_params(filepath: Path) -> Optional[Dict[str, Any]]:
+    if not filepath.exists():
+        logging.error(f"Best parameters file not found: {filepath}")
+        return None
+    try:
+        with open(filepath, 'rb') as f:
+            params = pickle.load(f)
+        logging.info(f"Loaded best hyperparameters from {filepath}")
+        if not isinstance(params, dict) or 'node_hidden_dim' not in params or 'gat_heads' not in params or 'lr' not in params:
+            logging.error(f"Invalid best parameters file: {filepath}")
+            return None
+        if params.get('gat_heads') != 1:
+            logging.warning(f"Loaded gat_heads={params.get('gat_heads')}, expected 1.")
+        return params
+    except Exception as e:
+        logging.error(f"Error loading best parameters from {filepath}: {e}")
+        return None
+
+class TemporalEncoder(torch.nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.conv1 = torch.nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1)
+        self.lstm = torch.nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
+        self.activation = torch.nn.ReLU()
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.activation(self.conv1(x))
+        x = x.permute(0, 2, 1)
+        x, (hn, cn) = self.lstm(x)
+        return hn[0, :, :]
+
+class StockGAT(torch.nn.Module):
+    def __init__(self, node_dim: int, edge_dim: int, out_dim: int, heads: int):
+        super().__init__()
+        if node_dim <= 0 or out_dim <= 0 or heads <= 0: raise ValueError(">0 dims/heads needed")
+        gat_out_per_head = max(1, out_dim // heads)
+        self.gat = GATConv(node_dim, gat_out_per_head, edge_dim=edge_dim, heads=heads, aggr='mean')
+        self.activation = torch.nn.ELU()
+    def forward(self, x, edge_index, edge_attr):
+        if edge_attr is not None and edge_attr.numel() == 0: edge_attr = None
+        x = self.gat(x, edge_index, edge_attr=edge_attr)
+        return self.activation(x)
+
+class CrossAttentionFusion(torch.nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        if embed_dim <= 0 or num_heads <= 0: raise ValueError(">0 dims/heads needed")
+        if num_heads > 0 and embed_dim % num_heads != 0:
+            possible_heads = [h for h in range(num_heads, 0, -1) if embed_dim % h == 0]
+            num_heads = possible_heads[0] if possible_heads else 1
+            logging.warning(f"Adjusted CrossAttention num_heads to {num_heads}.")
+        self.attention = MultiheadAttention(embed_dim, num_heads=num_heads, batch_first=True)
+    def forward(self, temporal_features, graph_features):
+        q, k, v = temporal_features.unsqueeze(1), graph_features.unsqueeze(1), graph_features.unsqueeze(1)
+        attn_output, _ = self.attention(q, k, v)
+        return temporal_features + attn_output.squeeze(dim=1)
+
+class StockForecastGNN(torch.nn.Module):
+    def __init__(self, num_features: int, node_hidden_dim: int, gat_heads: int, edge_dim: int, num_quantiles: int):
+        super().__init__()
+        if node_hidden_dim <= 0 or gat_heads <= 0: raise ValueError("Dims/heads > 0 needed")
+        self.temporal_encoder = TemporalEncoder(input_dim=num_features, hidden_dim=node_hidden_dim)
+        gat_out_per_head = max(1, node_hidden_dim // gat_heads)
+        gat_internal_out_dim_target = gat_out_per_head * gat_heads
+        self.gat = StockGAT(node_dim=node_hidden_dim, edge_dim=edge_dim, out_dim=gat_internal_out_dim_target, heads=gat_heads)
+        gat_final_out_dim = gat_internal_out_dim_target
+        self.cross_attn = CrossAttentionFusion(embed_dim=gat_final_out_dim, num_heads=gat_heads)
+        tf_d_model = gat_final_out_dim
+        tf_nhead = gat_heads
+        if tf_nhead > 0 and tf_d_model % tf_nhead != 0:
+            possible_heads = [h for h in range(tf_nhead, 0, -1) if tf_d_model % h == 0]
+            tf_nhead = possible_heads[0] if possible_heads else 1
+            logging.warning(f"Adjusted Transformer nhead to {tf_nhead}.")
+        self.transformer_layer = torch.nn.TransformerEncoderLayer(d_model=tf_d_model, nhead=tf_nhead, dim_feedforward=tf_d_model * 2, activation='relu', batch_first=True)
+        self.output_projection = torch.nn.Linear(tf_d_model, num_quantiles)
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: Optional[torch.Tensor]) -> torch.Tensor:
+        temporal_feats = self.temporal_encoder(x)
+        graph_feats = self.gat(temporal_feats, edge_index, edge_attr)
+        if temporal_feats.shape[-1] != graph_feats.shape[-1]:
+            logging.warning(f"Dim mismatch fusion: T={temporal_feats.shape}, G={graph_feats.shape}.")
+            if graph_feats.shape[-1] < temporal_feats.shape[-1]:
+                temporal_feats = temporal_feats[:, :graph_feats.shape[-1]]
+            elif temporal_feats.shape[-1] < graph_feats.shape[-1]:
+                graph_feats = graph_feats[:, :temporal_feats.shape[-1]]
+        fused_feats = self.cross_attn(temporal_feats, graph_feats)
+        context = self.transformer_layer(fused_feats.unsqueeze(1))
+        context = context[:, 0, :]
+        quantile_preds = self.output_projection(context)
+        return quantile_preds
+
+# --- START OF REPLACEMENT: fetch_latest_data using yfinance ---
+def fetch_latest_data(
+    tickers: List[str],
+    time_aggregate: str,
+    time_unit: str,
+    seq_len: int,
+    api_key: str = None,  # kept for signature compatibility; not used by yfinance
+) -> Optional[pd.DataFrame]:
+    """
+    Fetch the most recent market data for the requested tickers using *yfinance* and
+    return it in the exact structure expected by the rest of the script:
+        • Multi‑index columns → level‑0=ticker symbol, level‑1=feature
+        • Index             → int64 epoch milliseconds (“Timestamp_ms”)
+        • Only market‑hours bars (09:30‑16:00 US/Eastern)
+        • Exactly ``seq_len`` rows per ticker; NaNs forward/back‑filled
+    The function retries automatically and deliberately issues a *single* batched
+    request to avoid running into Yahoo’s undocumented rate‑limits.
+    """
+    logger = logging.getLogger(__name__) # Uses local logger
+
+    # ----------------------------- interval handling --------------------------
+    supported_min_intervals = {1, 2, 5, 15, 30}
+    supported_hr_intervals  = {1, 2}  # Yahoo explicitly supports 60 m & 120 m
+    time_aggregate_int = int(time_aggregate)
+
+    if time_unit == "minute":
+        if time_aggregate_int not in supported_min_intervals:
+            logger.error(f"yfinance only supports {sorted(supported_min_intervals)}‑minute bars. Requested: {time_aggregate_int}m")
+            return None
+        interval_str = f"{time_aggregate_int}m"
+        # Calculate lookback_days: ensure enough trading days to get seq_len points.
+        # Approx. 6.5 trading hours/day = 390 minutes/day.
+        # For 1m interval and seq_len=60, need 60 minutes. 1 day is usually enough.
+        # For 30m interval and seq_len=60, need 1800 minutes = 30 hours. ~5 trading days.
+        # Add buffer.
+        minutes_per_day_trading = 6.5 * 60
+        total_minutes_needed = seq_len * time_aggregate_int
+        lookback_days = math.ceil(total_minutes_needed / minutes_per_day_trading) + 2 # +2 for buffer
+
+    elif time_unit == "hour":
+        if time_aggregate_int not in supported_hr_intervals:
+            logger.error(f"yfinance supports only 1‑hour (60m) or 2‑hour (120m) bars. Requested: {time_aggregate_int}h")
+            return None
+        interval_str = f"{time_aggregate_int * 60}m" # yfinance uses minutes for hourly, e.g. "60m", "120m"
+        # For 1h interval and seq_len=60, need 60 hours. ~10 trading days.
+        hours_per_day_trading = 6.5
+        total_hours_needed = seq_len * time_aggregate_int
+        lookback_days = math.ceil(total_hours_needed / hours_per_day_trading) + 3 # +3 for buffer
+    else:
+        logger.error("Unsupported time_unit (use 'minute' or 'hour').")
+        return None
+
+    # yfinance limit for intraday data is typically 60 days for 1m-30m, can be shorter for some.
+    # Max period for <1d interval is 60 days. For 1h it's 730 days.
+    # Let's cap lookback to be safe for minute intervals.
+    if "m" in interval_str and interval_str != "60m" and interval_str != "120m": # minute intervals other than 1h/2h
+        lookback_days = min(lookback_days, 59) # Max 60 days, use 59 for safety.
+    else: # hourly intervals
+        lookback_days = min(lookback_days, 729)
+
+
+    logger.info(f"Fetching with yfinance: interval='{interval_str}', lookback='{lookback_days}d' for {seq_len} points.")
+
+    # ------------------------------- download ---------------------------------
+    ticker_str = " ".join(tickers)
+    retries = 3
+    delay   = 5  # seconds between retries
+    df_raw: Optional[pd.DataFrame] = None
+
+    for attempt in range(retries):
+        try:
+            df_raw = yf.download(
+                tickers=ticker_str,
+                period=f"{lookback_days}d",
+                interval=interval_str,
+                group_by="ticker", # Important for multi-ticker structure
+                auto_adjust=False, # Get raw OHLCV
+                threads=True,     # thread‑pooled single Yahoo query
+                progress=False,
+                timeout=30 # Add timeout
+            )
+            if df_raw is not None and not df_raw.empty:
+                # Check if all tickers are present (for multi-ticker download)
+                if len(tickers) > 1:
+                    if not all(ticker in df_raw.columns.levels[0] for ticker in tickers):
+                        logger.warning(f"Attempt {attempt+1}/{retries}: Not all tickers found in yfinance response. Retrying...")
+                        df_raw = None # Force retry
+                        raise ValueError("Missing ticker data in yfinance response")
+                    # Check if data exists for each ticker (some columns might be all NaN)
+                    valid_data_exists = True
+                    for ticker in tickers:
+                        if df_raw[ticker].isnull().all().all(): # Check if all columns for this ticker are NaN
+                            logger.warning(f"Attempt {attempt+1}/{retries}: All data for {ticker} is NaN. Retrying...")
+                            valid_data_exists = False
+                            break
+                    if not valid_data_exists:
+                         df_raw = None
+                         raise ValueError("All NaN data for a ticker")
+                elif df_raw.isnull().all().all(): # Single ticker, check if all data is NaN
+                    logger.warning(f"Attempt {attempt+1}/{retries}: All data for {tickers[0]} is NaN. Retrying...")
+                    df_raw = None
+                    raise ValueError("All NaN data for the ticker")
+
+                break # Successful download
+        except Exception as e:
+            logger.warning(f"yfinance download failed (attempt {attempt+1}/{retries}): {e}")
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1)) # Exponential backoff
+            else:
+                logger.error("Failed to download data after multiple attempts.")
+                return None
+
+    if df_raw is None or df_raw.empty:
+        logger.error("No data returned from yfinance after retries.")
+        return None
+
+
+    # -------------------------- reshape & clean -------------------------------
+    eastern = pytz.timezone("US/Eastern") # Matches MARKET_TIMEZONE
+    market_open  = datetime.time(9, 30)
+    market_close = datetime.time(16, 0) # Market close is exclusive for intraday bars
+
+    required_cols = ["Open", "High", "Low", "Close", "Volume"] # Matches FEATURES
+    all_ticker_frames: Dict[str, pd.DataFrame] = {}
+
+    for ticker_idx, ticker_symbol in enumerate(tickers):
+        try:
+            # Access data: yf.download structure for multiple tickers is a MultiIndex column
+            # If only one ticker, it's a simple DataFrame.
+            if len(tickers) > 1:
+                ticker_df = df_raw[ticker_symbol].copy()
+            else:
+                ticker_df = df_raw.copy()
+        except KeyError:
+            logger.error(f"Ticker '{ticker_symbol}' missing in yfinance response structure. This might indicate a problem with the ticker symbol or data availability.")
+            return None # Critical error if a ticker is outright missing
+
+        # Ensure required columns exist
+        if not all(col in ticker_df.columns for col in required_cols):
+            logger.error(f"Missing one of required columns {required_cols} for ticker {ticker_symbol}. Available: {ticker_df.columns.tolist()}")
+            return None
+
+        ticker_df = ticker_df[required_cols] # Select only needed columns
+        ticker_df = ticker_df.dropna(subset=["Close"]) # Drop rows where 'Close' is NaN (usually non-trading periods)
+
+        if ticker_df.empty:
+            logger.warning(f"No valid (non-NaN Close) data for {ticker_symbol} after initial load.")
+            # Allow to proceed, maybe other tickers have data and ffill/bfill can handle it later if this is part of combined df
+            # If it's the only ticker, this is an issue.
+            if len(tickers) == 1:
+                 logger.error(f"No data for single ticker {ticker_symbol}. Cannot proceed.")
+                 return None
+            # Create an empty DF with correct columns to avoid issues in concat, but log warning
+            all_ticker_frames[ticker_symbol] = pd.DataFrame(columns=required_cols + ["Timestamp_ms"]).set_index("Timestamp_ms")
+            continue
+
+
+        # Timestamps are localized by yfinance if timezone info available, typically to market's TZ.
+        # If index is naive, assume it's market time (e.g. US/Eastern for US stocks) and localize.
+        # If index is tz-aware, convert to UTC then to US/Eastern for consistent filtering.
+        if ticker_df.index.tz is None:
+            ticker_df.index = ticker_df.index.tz_localize(eastern) # Assume market time if naive
+        else:
+            ticker_df.index = ticker_df.index.tz_convert(eastern)
+
+        # Filter by market hours
+        ticker_df = ticker_df[
+            (ticker_df.index.time >= market_open) &
+            (ticker_df.index.time < market_close) #Polygon used inclusive start, exclusive end. Yahoo usually provides bars starting at 9:30 for 9:30-9:31 (1m bar)
+        ]
+
+        # Convert Volume to int64, handle potential float if NaNs existed before dropna
+        ticker_df['Volume'] = ticker_df['Volume'].astype(np.int64)
+
+        if ticker_df.empty:
+            logger.warning(f"No data for {ticker_symbol} after market hours filtering.")
+            if len(tickers) == 1:
+                 logger.error(f"No data for single ticker {ticker_symbol} post-filtering. Cannot proceed.")
+                 return None
+            all_ticker_frames[ticker_symbol] = pd.DataFrame(columns=required_cols + ["Timestamp_ms"]).set_index("Timestamp_ms")
+            continue
+
+        # Take last seq_len points AFTER all filtering
+        ticker_df = ticker_df.tail(seq_len)
+
+        if len(ticker_df) < seq_len:
+            logger.warning(f"For ticker {ticker_symbol}, only {len(ticker_df)} data points found after filtering, less than required {seq_len}. This might lead to issues or require more lookback.")
+            # To ensure consistent shape for concatenation if other tickers have full data,
+            # we might need to pad. However, the main script expects full seq_len.
+            # If critical, return None or raise error. For now, log and proceed.
+            # This could be problematic for downstream processing if not handled.
+            # The script expects exactly seq_len rows.
+            if len(tickers) == 1 or len(ticker_df) == 0: # If only one ticker, or this ticker now has 0 rows
+                 logger.error(f"Critical: Ticker {ticker_symbol} has insufficient data ({len(ticker_df)}/{seq_len}). Cannot form valid input.")
+                 return None
+
+
+        # Convert the timestamp to epoch ms integer and set as index
+        # Index is already US/Eastern, convert to UTC for epoch calculation for consistency
+        ticker_df.index = ticker_df.index.tz_convert('UTC')
+        ticker_df["Timestamp_ms"] = (
+            ticker_df.index.view("int64") // 1_000_000  # ns → ms
+        ).astype(np.int64)
+        ticker_df = ticker_df.set_index("Timestamp_ms")
+
+        all_ticker_frames[ticker_symbol] = ticker_df.copy()
+
+    if not all_ticker_frames or all(df.empty for df in all_ticker_frames.values()):
+        logger.error("No data for any ticker after processing.")
+        return None
+
+    # ---------------------------- consolidate ---------------------------------
+    # Filter out tickers that ended up with empty dataframes before concat
+    valid_ticker_frames = {t: df for t, df in all_ticker_frames.items() if not df.empty}
+    if not valid_ticker_frames:
+        logger.error("All tickers resulted in empty dataframes after processing.")
+        return None
+
+    if len(valid_ticker_frames) < len(tickers):
+        missing_tickers_data = set(tickers) - set(valid_ticker_frames.keys())
+        logger.warning(f"Data could not be processed for tickers: {missing_tickers_data}. Proceeding with available data for {list(valid_ticker_frames.keys())}")
+        # This might be an issue if the model expects a fixed number of nodes = len(TICKERS_LIST)
+        # The current script structure might break if NUM_NODES doesn't match actual data.
+        # For now, proceed with what we have and let downstream handle or error out.
+        # A better approach might be to return None if any ticker is missing.
+        logger.error(f"Failed to get data for all requested tickers. Missing: {missing_tickers_data}. Aborting fetch.")
+        return None
+
+
+    combined_df = pd.concat(valid_ticker_frames, axis=1, keys=valid_ticker_frames.keys()) # Use keys from valid_ticker_frames to maintain order
+
+    # Ensure columns are 'Ticker', 'Feature'
+    if isinstance(combined_df.columns, pd.MultiIndex):
+        combined_df.columns = pd.MultiIndex.from_tuples(
+            combined_df.columns, names=["Ticker", "Feature"]
+        )
+    else: # Should not happen if keys are used in concat with multiple frames
+        logger.error("Concatenation did not result in MultiIndex columns as expected.")
+        return None
+
+    combined_df = combined_df.sort_index(axis=1) # Sort by Ticker, then Feature
+
+    # Check if any ticker has less than seq_len rows after concat (e.g., due to different trading times alignment)
+    # This is usually handled by intersection of timestamps during concat if not aligned.
+    # If any ticker has fewer than seq_len rows at this stage, it's an issue.
+    # The .tail(seq_len) on combined_df will ensure final df has at most seq_len rows.
+    # We need to ensure all tickers *within* those seq_len rows have non-NaN data.
+
+    # Fill NaNs that might arise from slight misalignments or missing data for some tickers at specific timestamps
+    if combined_df.isnull().values.any():
+        logger.warning("NaNs detected in combined DataFrame – forward/back filling.")
+        # Group by ticker for filling to avoid cross- contaminación
+        for ticker_symbol in valid_ticker_frames.keys():
+            if ticker_symbol in combined_df.columns.get_level_values('Ticker'):
+                 ticker_slice_cols = combined_df.xs(ticker_symbol, level='Ticker', axis=1).columns
+                 for feature_col in ticker_slice_cols:
+                      combined_df[(ticker_symbol, feature_col)] = combined_df[(ticker_symbol, feature_col)].ffill().bfill()
+
+        if combined_df.isnull().values.any():
+            logger.error("Unresolved NaNs remain after targeted forward/back filling. This might indicate large gaps for some tickers.")
+            # Check which tickers/features still have NaNs
+            nan_info = combined_df.isnull().sum()
+            nan_info = nan_info[nan_info > 0]
+            logger.error(f"NaNs persist in: \n{nan_info}")
+            return None
+
+    # Final check for seq_len for all tickers within the combined frame
+    # The combined_df index will be the union of all timestamps. We need common coverage.
+    # A simpler approach is to ensure each ticker_df had seq_len before concat,
+    # and then rely on concat + ffill/bfill.
+    # The most robust way is to take the last seq_len records from the combined frame.
+
+    final_df = combined_df.tail(seq_len)
+
+    if len(final_df) < seq_len:
+        logger.error(f"Final combined DataFrame has {len(final_df)} rows, less than required {seq_len}. This indicates insufficient overlapping data.")
+        return None
+
+    # Final check for NaNs in the (potentially truncated) final_df
+    if final_df.isnull().values.any():
+        logger.error("NaNs still present in the final DataFrame of seq_len. This should not happen if ffill/bfill was effective.")
+        return None
+
+    logger.info(f"Successfully fetched and processed data for {list(valid_ticker_frames.keys())} with {len(final_df)} rows.")
+    return final_df
+# --- END OF REPLACEMENT ---
+
+def scale_realtime_data(df: pd.DataFrame, scalers: Dict[str, Dict[str, StandardScaler]], tickers: List[str], features: List[str]) -> Optional[pd.DataFrame]:
+    scaled_df = df.copy()
+    try:
+        for ticker in tickers:
+            if ticker not in scalers:
+                logging.error(f"Scaler not found for ticker: {ticker}")
+                return None
+            for feature in features:
+                if feature not in scalers[ticker]:
+                    if feature == 'Volume': # Allow volume to not be scaled if scaler missing
+                        logging.warning(f"Scaler for 'Volume' (ticker '{ticker}') not found. Using raw value.")
+                        continue # Keep raw volume if no scaler
+                    logging.error(f"Scaler not found for feature '{feature}' (ticker: {ticker})")
+                    return None
+                scaler = scalers[ticker][feature]
+                data_series = df[(ticker, feature)]
+                data_reshaped = data_series.values.reshape(-1, 1)
+                scaled_df[(ticker, feature)] = scaler.transform(data_reshaped).flatten()
+        return scaled_df
+    except Exception as e:
+        logging.error(f"Error scaling data: {e}")
+        return None
+
+def compute_correlation_edges(data_window: np.ndarray, threshold: float, ticker_list: List[str], features_list: List[str], target_feature: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    if data_window.size == 0 or data_window.ndim != 3:
+        logging.warning("Invalid data_window for correlation.")
+        return torch.empty((2, 0), dtype=torch.long), torch.empty((0, EDGE_FEATURE_DIM), dtype=torch.float)
+    num_nodes, seq_len, num_features = data_window.shape
+    if num_nodes <= 1:
+        return torch.empty((2, 0), dtype=torch.long), torch.empty((0, EDGE_FEATURE_DIM), dtype=torch.float)
+    try:
+        target_idx = features_list.index(target_feature)
+    except ValueError:
+        logging.error(f"Target feature '{target_feature}' not found.")
+        return torch.empty((2, 0), dtype=torch.long), torch.empty((0, EDGE_FEATURE_DIM), dtype=torch.float)
+    target_sequences = data_window[:, :, target_idx]
+    if np.any(~np.isfinite(target_sequences)):
+        logging.warning("Non-finite values in target sequences. Replacing with 0.")
+        target_sequences = np.nan_to_num(target_sequences)
+    df_target = pd.DataFrame(target_sequences.T, columns=ticker_list)
+    non_constant_cols = df_target.columns[df_target.nunique() > 1]
+    if len(non_constant_cols) <= 1:
+        logging.warning("Too few non-constant sequences for correlation matrix. No edges will be created.")
+        return torch.empty((2, 0), dtype=torch.long), torch.empty((0, EDGE_FEATURE_DIM), dtype=torch.float)
+    corr_matrix = df_target[non_constant_cols].corr().fillna(0)
+    # Ensure corr_matrix has all original tickers, filling with 0 for those not in non_constant_cols
+    corr_matrix = corr_matrix.reindex(index=ticker_list, columns=ticker_list, fill_value=0).values
+
+    adj = (np.abs(corr_matrix) > threshold).astype(int)
+    np.fill_diagonal(adj, 0)
+    edge_index_np = np.array(np.where(adj))
+    edge_attr_values = corr_matrix[adj == 1] # Get correlation values for actual edges
+
+    if edge_index_np.shape[1] == 0: # No edges found
+        return torch.empty((2, 0), dtype=torch.long), torch.empty((0, EDGE_FEATURE_DIM), dtype=torch.float)
+
+    edge_attr_np = edge_attr_values.reshape(-1, EDGE_FEATURE_DIM)
+    edge_index = torch.tensor(edge_index_np, dtype=torch.long)
+    edge_attr = torch.tensor(edge_attr_np, dtype=torch.float)
+
+    # This check should ideally not be needed if logic is correct
+    if edge_index.shape[1] != edge_attr.shape[0]:
+        logging.warning(f"Mismatch in edge_index ({edge_index.shape[1]}) and edge_attr ({edge_attr.shape[0]}) count. This is unexpected. Trimming.")
+        min_dim = min(edge_index.shape[1], edge_attr.shape[0])
+        edge_index = edge_index[:, :min_dim]
+        edge_attr = edge_attr[:min_dim, :]
+        if min_dim == 0:
+            return torch.empty((2, 0), dtype=torch.long), torch.empty((0, EDGE_FEATURE_DIM), dtype=torch.float)
+    return edge_index, edge_attr
+
+def build_onnx(model_weights_path: Path, onnx_target_path: Path, best_params: Dict, num_features: int, edge_feature_dim: int, num_quantiles: int) -> bool:
+    if not ONNX_AVAILABLE or not GS_AVAILABLE:
+        logging.error("Required ONNX libraries not installed.")
+        return False
+    if onnx_target_path.exists() and not FORCE_REBUILD:
+        logging.info(f"ONNX model exists: {onnx_target_path}")
+        return True
+    if not model_weights_path.exists():
+        logging.error(f"Model weights not found: {model_weights_path}")
+        return False
+    temp_onnx_export_path = onnx_target_path.with_suffix('.temp_export.onnx')
+    temp_onnx_simplified_path = onnx_target_path.with_suffix('.temp_simplified.onnx')
+    try:
+        model = StockForecastGNN(num_features=num_features, node_hidden_dim=best_params['node_hidden_dim'], gat_heads=best_params.get('gat_heads', 1), edge_dim=edge_feature_dim, num_quantiles=num_quantiles)
+        model.load_state_dict(torch.load(model_weights_path, map_location='cpu'))
+        model.eval()
+        dummy_x = torch.randn(NUM_NODES, SEQ_LEN, num_features)
+        # MAX_EDGES can be 0 if NUM_NODES is 1. Handle this for dummy_ei and dummy_ea.
+        if MAX_EDGES > 0 :
+            dummy_ei = torch.randint(0, NUM_NODES, (2, MAX_EDGES), dtype=torch.long)
+            dummy_ea = torch.randn(MAX_EDGES, edge_feature_dim)
+        else: # Case for NUM_NODES <= 1
+            dummy_ei = torch.empty((2,0), dtype=torch.long)
+            dummy_ea = torch.empty((0, edge_feature_dim), dtype=torch.float) # Must match type
+
+        logging.info(f"Exporting model to ONNX: {temp_onnx_export_path}")
+        torch.onnx.export(model, (dummy_x, dummy_ei, dummy_ea), str(temp_onnx_export_path), opset_version=16, do_constant_folding=True, input_names=["node_features", "edge_index", "edge_attributes"], output_names=["quantile_predictions"])
+        logging.info(f"Exported ONNX to {temp_onnx_export_path}")
+        if SIM_AVAILABLE:
+            logging.info("Simplifying ONNX model...")
+            simplified_model, check = onnxsim.simplify(str(temp_onnx_export_path))
+            if check:
+                onnx.save(simplified_model, str(temp_onnx_simplified_path))
+                onnx_path_for_gs = temp_onnx_simplified_path
+                logging.info(f"Simplified ONNX saved to {temp_onnx_simplified_path}")
+            else:
+                logging.error("ONNX simplification failed.")
+                onnx_path_for_gs = temp_onnx_export_path
+        else:
+            onnx_path_for_gs = temp_onnx_export_path
+        logging.info(f"Loading ONNX for patching: {onnx_path_for_gs}")
+        graph = gs.import_onnx(onnx.load(str(onnx_path_for_gs)))
+        if graph is None:
+            logging.error("Failed to import ONNX graph.")
+            return False
+        nodes_patched = 0
+        for node in graph.nodes:
+            if node.op == "Squeeze":
+                logging.debug(f"Processing Squeeze node: {node.name}")
+                axes_const = gs.Constant(name=f"{node.name}_axes_patched", values=np.array([1], dtype=np.int64))
+                if len(node.inputs) == 1: # Squeeze without explicit axes
+                    node.inputs.append(axes_const)
+                elif len(node.inputs) == 2: # Squeeze with existing axes input
+                    node.inputs[1] = axes_const # Replace existing axes
+                nodes_patched += 1
+                logging.info(f"Patched Squeeze node '{node.name}' with axes=[1]")
+        if nodes_patched > 0:
+            logging.info(f"Patched {nodes_patched} Squeeze nodes.")
+        else:
+            logging.warning("No Squeeze nodes found or patched. This might be okay if model structure changed.")
+        graph.cleanup().toposort()
+        onnx.save(gs.export_onnx(graph), str(onnx_target_path))
+        logging.info(f"Saved patched ONNX model to: {onnx_target_path}")
+        final_model = onnx.load(str(onnx_target_path))
+        onnx.checker.check_model(final_model)
+        logging.info("ONNX model passed validation.")
+        return True
+    except Exception as e:
+        logging.error(f"Error in build_onnx: {e}", exc_info=True)
+        return False
+    finally:
+        if temp_onnx_export_path.exists():
+            temp_onnx_export_path.unlink()
+        if temp_onnx_simplified_path.exists():
+            temp_onnx_simplified_path.unlink()
+
+def build_engine(onnx_path: Path, engine_path: Path, use_fp16: bool) -> bool:
+    if not TRT_AVAILABLE:
+        logging.error("TensorRT not available.")
+        return False
+    trt.init_libnvinfer_plugins(TRT_LOGGER, "")
+    if engine_path.exists() and not FORCE_REBUILD:
+        logging.info(f"TensorRT engine exists: {engine_path}")
+        return True
+    if not onnx_path.exists():
+        logging.error(f"ONNX file not found: {onnx_path}")
+        return False
+    logging.info(f"Building TensorRT engine (FP16={use_fp16}): {engine_path}")
+    builder = trt.Builder(TRT_LOGGER)
+    network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    network = builder.create_network(network_flags)
+    config = builder.create_builder_config()
+    parser = trt.OnnxParser(network, TRT_LOGGER)
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30) # 1GB
+    if use_fp16 and builder.platform_has_fast_fp16:
+        config.set_flag(trt.BuilderFlag.FP16)
+        logging.info("Using FP16 mode.")
+    elif use_fp16:
+        logging.warning("FP16 requested but not supported by platform. Using FP32.")
+
+    with open(onnx_path, 'rb') as model_file:
+        if not parser.parse(model_file.read()):
+            logging.error("Failed to parse ONNX file.")
+            for error_idx in range(parser.num_errors):
+                logging.error(f"Parser Error [{error_idx}]: {parser.get_error(error_idx)}")
+            return False
+    logging.info("ONNX file parsed successfully.")
+
+    profile = builder.create_optimization_profile()
+    num_features = len(FEATURES)
+
+    # Define shapes for profile
+    # For node_features: (NUM_NODES, SEQ_LEN, num_features)
+    shape_x = (NUM_NODES, SEQ_LEN, num_features)
+    profile.set_shape("node_features", min=shape_x, opt=shape_x, max=shape_x)
+
+    # For edge_index: (2, MAX_EDGES)
+    # MAX_EDGES can be 0 if NUM_NODES <=1. Engine build might require at least 1 for dynamic shape.
+    # Let's assume MAX_EDGES is at least 1 if it's used, or handle 0-edge case carefully.
+    # If MAX_EDGES is 0, shape (2,0) might be problematic for TRT profiles.
+    # Smallest valid shape for an edge dimension is typically 1 if dynamic, or 0 if fixed and truly empty.
+    # The ONNX model is exported with MAX_EDGES. If MAX_EDGES is 0, dummy_ei is (2,0).
+    # This might need specific handling in TRT if (2,0) is not accepted.
+    # For safety, let's use (2,1) as min/opt/max if MAX_EDGES is 0, understanding that the actual passed data will be (2,0).
+    # This is a common workaround for TRT not liking zero dimensions in profiles for dynamic inputs.
+    # However, since we are using static shapes in profile, (2, MAX_EDGES) should be correct.
+    # If MAX_EDGES is 0, shape_ei will be (2,0).
+    shape_ei = (2, MAX_EDGES if MAX_EDGES > 0 else 0) # Use 0 if MAX_EDGES is 0. Let's see if TRT handles (N,0)
+    profile.set_shape("edge_index", min=shape_ei, opt=shape_ei, max=shape_ei)
+
+    # For edge_attributes: (MAX_EDGES, EDGE_FEATURE_DIM)
+    shape_ea = (MAX_EDGES if MAX_EDGES > 0 else 0, EDGE_FEATURE_DIM)
+    profile.set_shape("edge_attributes", min=shape_ea, opt=shape_ea, max=shape_ea)
+
+    config.add_optimization_profile(profile)
+
+    logging.info("Building serialized network...")
+    try:
+        serialized_engine = builder.build_serialized_network(network, config)
+        if serialized_engine is None:
+            logging.error("Engine building failed (build_serialized_network returned None).")
+            return False
+        with open(engine_path, "wb") as f:
+            f.write(serialized_engine)
+        logging.info(f"TensorRT engine saved to: {engine_path}")
+        return True
+    except Exception as e:
+        logging.error(f"Error during engine build: {e}", exc_info=True)
+        if engine_path.exists(): engine_path.unlink() # Clean up partial engine file
+        return False
+    finally:
+        # It's good practice to delete builder, network, config, parser to free memory,
+        # especially if this function could be called multiple times.
+        del parser
+        del config
+        del network
+        del builder
+
+class HostDeviceMem(object):
+    def __init__(self, host_mem, device_mem):
+        self.host = host_mem
+        self.device = device_mem
+    def __str__(self): return f"Host:\n{self.host}\nDevice:\n{self.device}"
+    def __repr__(self): return str(self)
+
+def allocate_buffers(engine: trt.ICudaEngine):
+    inputs = []
+    outputs = []
+    bindings = [] # Stores device pointers (int)
+    stream = cuda.Stream()
+    binding_map = {} # Maps tensor name to binding index
+
+    # Ensure profile 0 is used for shape queries if multiple profiles exist (though we add only one)
+    # context_for_shapes = engine.create_execution_context() # Create a temp context for shape queries
+    # context_for_shapes.set_optimization_profile_async(0, stream.handle) # For dynamic shapes
+
+    for binding_idx in range(engine.num_io_tensors): # engine.num_bindings deprecated for explicit I/O tensors
+        tensor_name = engine.get_tensor_name(binding_idx)
+        binding_map[tensor_name] = binding_idx # Store name to index mapping
+
+        dtype = trt.nptype(engine.get_tensor_dtype(tensor_name))
+
+        # Get shape from the profile for allocation (using opt shape)
+        # For static shapes as used in profile, min=opt=max.
+        # Using engine.get_binding_shape(binding_idx) might be -1 for dynamic dims
+        # engine.get_tensor_shape(tensor_name) is preferred
+        shape = engine.get_tensor_shape(tensor_name) # This is the shape defined in ONNX, can have -1
+
+        # If shape has dynamic dimensions (-1), use opt shape from profile for allocation
+        # For static profiles, this will be the defined static shape.
+        # This is crucial for inputs. For outputs, shape might be inferred.
+        if engine.get_tensor_mode(tensor_name) == trt.TensorIOMode.INPUT:
+            # Use opt shape from profile for inputs
+            _, opt_shape, _ = engine.get_tensor_profile_shape(tensor_name, 0) # Profile 0
+            shape = opt_shape
+            # If any dim in opt_shape is -1 (should not happen for fully static profile), error.
+            if any(d == -1 for d in shape):
+                logging.error(f"Cannot determine allocation size for input '{tensor_name}': opt_shape {shape} has dynamic dimensions.")
+                return None, None, None, None, None
+
+
+        # For outputs, if the shape from get_tensor_shape still has -1,
+        # we might need to run inference once with max_shape inputs to determine it,
+        # or use a sufficiently large buffer based on max_profile_shape.
+        # For now, assume output shapes are fully defined or can be derived from max profile.
+        # If output shape from get_tensor_shape is dynamic, use max_shape from profile
+        if engine.get_tensor_mode(tensor_name) == trt.TensorIOMode.OUTPUT and any(d == -1 for d in shape):
+            _, _, max_shape_output = engine.get_tensor_profile_shape(tensor_name, 0)
+            shape = max_shape_output
+            if any(d == -1 for d in shape):
+                logging.error(f"Cannot determine allocation size for output '{tensor_name}': max_shape {shape} from profile still has dynamic dimensions.")
+                return None, None, None, None, None
+
+        current_num_elements = trt.volume(shape)
+        # Handle 0-size tensors (e.g. for MAX_EDGES=0)
+        # cuda.pagelocked_empty(0, ...) is valid, cuda.mem_alloc(0) might not be or might return special ptr.
+        # It's safer to allocate a minimal buffer if size is 0, or handle it carefully.
+        # For this script, MAX_EDGES can be 0, leading to 0-size edge_index/attributes.
+
+        if current_num_elements < 0: # Should not happen if shapes are resolved
+            logging.error(f"Calculated volume for {tensor_name} is negative: {current_num_elements}, shape {shape}")
+            return None, None, None, None, None
+
+        # Allocate memory
+        # For 0-sized tensors, host_mem.nbytes will be 0. mem_alloc(0) behavior can be tricky.
+        # Some TRT backends might require non-null pointers even for 0-sized tensors.
+        # Let's allow 0-byte allocations and see.
+        host_mem = cuda.pagelocked_empty(current_num_elements if current_num_elements > 0 else 1, dtype=dtype) # Allocate at least 1 element for empty
+        device_mem = cuda.mem_alloc(host_mem.nbytes) if current_num_elements > 0 else 0 # cuda.mem_alloc(0) might be ok or return null ptr.
+                                                                                          # Using 0 for device pointer if size is 0.
+        if current_num_elements > 0 and not device_mem:
+             logging.error(f"Device memory allocation failed for {tensor_name} (size: {host_mem.nbytes})")
+             return None, None, None, None, None
+
+        bindings.append(int(device_mem))
+        mem = HostDeviceMem(host_mem, device_mem)
+
+        if engine.get_tensor_mode(tensor_name) == trt.TensorIOMode.INPUT:
+            inputs.append(mem)
+        else: # trt.TensorIOMode.OUTPUT
+            outputs.append(mem)
+        logging.info(f"Allocated buffer for '{tensor_name}': shape={shape}, elements={current_num_elements}, dtype={dtype}, device_ptr={device_mem}")
+
+    # del context_for_shapes # Free temporary context
+    return inputs, outputs, bindings, stream, binding_map
+
+
+def predict_tensorrt(context: trt.IExecutionContext, engine: trt.ICudaEngine, inputs_host_device: List[HostDeviceMem], outputs_host_device: List[HostDeviceMem], bindings_device_ptrs: List[int], stream: cuda.Stream, binding_map: Dict[str, int], input_data_dict: Dict[str, np.ndarray]) -> Optional[Dict[str, np.ndarray]]:
+    logging.debug("Starting TRT inference")
+
+    context.set_optimization_profile_async(0, stream.handle) # Select profile 0
+
+    # Set input shapes (even for static, it's good practice)
+    for name, data_array in input_data_dict.items():
+        if name not in binding_map:
+            logging.error(f"Input tensor '{name}' not found in engine bindings.")
+            return None
+
+        # For static shapes, set_input_shape should still be called.
+        # It validates if the provided shape matches the expected static shape in the profile.
+        if not context.set_input_shape(name, data_array.shape):
+            logging.error(f"Failed to set input shape for '{name}' to {data_array.shape}. Expected: {engine.get_tensor_profile_shape(name,0)[1]}")
+            return None
+        logging.debug(f"Set input shape for '{name}' to {data_array.shape}")
+
+    if not context.all_binding_shapes_specified: # Deprecated. Use all_tensor_shapes_specified
+    # if not context.all_tensor_shapes_specified: # This is the newer API
+        logging.error("Not all input tensor binding shapes specified for the execution context.")
+        # This might be an issue with how TRT version handles this check or if an input is missing.
+        # For now, proceed with caution if this error appears.
+        # This check might be more relevant for dynamic shapes. With static profiles, it should pass.
+        # Let's assume for now this is not critical if all inputs are processed.
+
+    # Order inputs_host_device based on typical ONNX export order if necessary, or rely on names.
+    # The current allocation logic populates inputs_host_device in binding order.
+    # We need to map input_data_dict (by name) to the correct HostDeviceMem object.
+
+    # Copy input data to host buffers, then to device
+    for name, data_np_array in input_data_dict.items():
+        # Find the corresponding HostDeviceMem object for this input tensor name
+        binding_idx = binding_map[name]
+
+        # Find the HostDeviceMem object associated with this binding_idx/name
+        # This assumes inputs_host_device is ordered by binding_idx for inputs
+        # This needs a reliable way to map name to its HostDeviceMem object
+        # Let's find it by iterating through engine bindings to find its position among inputs
+        input_hdm_idx = -1
+        current_input_idx = 0
+        for i in range(engine.num_io_tensors):
+            if engine.get_tensor_name(i) == name:
+                if engine.get_tensor_mode(engine.get_tensor_name(i)) == trt.TensorIOMode.INPUT:
+                    input_hdm_idx = current_input_idx
+                    break
+                else: # Should not happen if name is in input_data_dict
+                    logging.error(f"Tensor {name} is not an input tensor in the engine.")
+                    return None
+            if engine.get_tensor_mode(engine.get_tensor_name(i)) == trt.TensorIOMode.INPUT:
+                current_input_idx += 1
+
+        if input_hdm_idx == -1:
+            logging.error(f"Could not find HostDeviceMem for input {name}")
+            return None
+
+        host_buffer_obj = inputs_host_device[input_hdm_idx]
+
+        # Handle 0-sized inputs (e.g. empty edge_index)
+        if data_np_array.size == 0:
+            logging.debug(f"Input '{name}' is empty (0 elements). Skipping H2D copy.")
+            # Ensure device pointer for this binding is set correctly even if 0.
+            # The device_ptr in bindings_device_ptrs should already be 0 if allocated as such.
+            # context.set_tensor_address should handle this.
+            continue # No data to copy
+
+        data_contiguous = np.ascontiguousarray(data_np_array)
+
+        if data_contiguous.nbytes > host_buffer_obj.host.nbytes:
+            logging.error(f"Input data for '{name}' ({data_contiguous.nbytes} bytes, shape {data_contiguous.shape}) "
+                          f"exceeds allocated host buffer size ({host_buffer_obj.host.nbytes} bytes, shape {host_buffer_obj.host.shape}).")
+            return None
+
+        # Copy into the host buffer (potentially a slice if buffer is larger, but should match for static)
+        # np.copyto(host_buffer_obj.host.reshape(data_contiguous.shape), data_contiguous) # This assumes host_buffer_obj.host is already shaped
+        # Safer: flatten both and copy, ensure shapes match
+        if host_buffer_obj.host.size < data_contiguous.size:
+             logging.error(f"Host buffer for {name} too small.")
+             return None
+
+        # Flatten and copy to the beginning of the host buffer
+        np.copyto(host_buffer_obj.host.ravel()[:data_contiguous.size], data_contiguous.ravel())
+
+        # Async H2D transfer
+        # We need to transfer exactly data_contiguous.nbytes
+        # The device memory (host_buffer_obj.device) was allocated for host_buffer_obj.host.nbytes
+        # If data_contiguous.nbytes < host_buffer_obj.host.nbytes (e.g. padding), transfer only actual data size
+        # However, for static shapes, they should be equal.
+        cuda.memcpy_htod_async(host_buffer_obj.device, host_buffer_obj.host, stream) # Transfer entire host buffer
+        logging.debug(f"Copied input '{name}' to device. Shape: {data_contiguous.shape}, Bytes: {data_contiguous.nbytes}")
+
+
+    # Set tensor addresses for all I/O tensors
+    for i in range(engine.num_io_tensors):
+        tensor_name = engine.get_tensor_name(i)
+        device_address = bindings_device_ptrs[i] # This is the int pointer
+
+        # For 0-size tensors, device_address might be 0. set_tensor_address should handle this.
+        if not context.set_tensor_address(tensor_name, device_address):
+            logging.error(f"Failed to set tensor address for '{tensor_name}' (ptr: {device_address}).")
+            return None
+        logging.debug(f"Set tensor address for '{tensor_name}' to {device_address}")
+
+    # Execute model
+    logging.debug("Executing inference.")
+    if not context.execute_async_v3(stream.handle): # Use v3 for stream-ordered memory
+        logging.error("TensorRT execute_async_v3 failed.")
+        return None
+
+    # Copy output data from device to host
+    for i, out_hd_mem in enumerate(outputs_host_device):
+        # Find the name of this output tensor. outputs_host_device is ordered by binding_idx for outputs.
+        output_name = ""
+        current_output_idx = 0
+        for binding_idx_eng in range(engine.num_io_tensors):
+            if engine.get_tensor_mode(engine.get_tensor_name(binding_idx_eng)) == trt.TensorIOMode.OUTPUT:
+                if current_output_idx == i:
+                    output_name = engine.get_tensor_name(binding_idx_eng)
+                    break
+                current_output_idx += 1
+        if not output_name:
+            logging.error(f"Could not determine name for output {i}")
+            return None
+
+        # Get actual output shape after execution
+        # This is important if outputs have dynamic shapes, though our profile is static.
+        actual_output_shape = tuple(context.get_tensor_shape(output_name))
+
+        if any(d == -1 for d in actual_output_shape):
+            logging.error(f"Output tensor '{output_name}' has dynamic dimensions {actual_output_shape} after execution. Cannot determine size for D2H copy.")
+            return None
+
+        output_elements = trt.volume(actual_output_shape)
+        output_dtype = trt.nptype(engine.get_tensor_dtype(output_name))
+
+        if output_elements == 0: # Handle 0-sized outputs
+            logging.debug(f"Output '{output_name}' is empty (0 elements). Skipping D2H copy.")
+            continue
+
+        bytes_to_copy = output_elements * np.dtype(output_dtype).itemsize
+
+        if bytes_to_copy > out_hd_mem.host.nbytes:
+            logging.error(f"Output data for '{output_name}' ({bytes_to_copy} bytes, shape {actual_output_shape}) "
+                          f"exceeds allocated host buffer size ({out_hd_mem.host.nbytes} bytes, shape {out_hd_mem.host.shape}).")
+            # This can happen if output shape was dynamic and max allocation was insufficient.
+            return None
+
+        # Async D2H transfer
+        # Copy only the valid part of the device buffer corresponding to actual_output_shape
+        # The device buffer (out_hd_mem.device) is large enough for max_profile_shape.
+        # We need to copy 'bytes_to_copy' from device to the host buffer.
+        # The host buffer (out_hd_mem.host) is also sized for max_profile_shape.
+        # We can copy into a view of the host buffer.
+
+        host_buffer_view = np.frombuffer(out_hd_mem.host.data[:bytes_to_copy], dtype=output_dtype)
+        cuda.memcpy_dtoh_async(host_buffer_view, out_hd_mem.device, stream)
+        logging.debug(f"Scheduled D2H copy for output '{output_name}'. Shape: {actual_output_shape}, Bytes: {bytes_to_copy}")
+
+    stream.synchronize()
+    logging.debug("TRT Inference synchronized.")
+
+    results = {}
+    # Process host buffers to create numpy arrays with correct shapes
+    for i, out_hd_mem in enumerate(outputs_host_device):
+        # Determine output name (as done above for D2H copy)
+        output_name = ""
+        current_output_idx = 0
+        for binding_idx_eng in range(engine.num_io_tensors):
+            if engine.get_tensor_mode(engine.get_tensor_name(binding_idx_eng)) == trt.TensorIOMode.OUTPUT:
+                if current_output_idx == i:
+                    output_name = engine.get_tensor_name(binding_idx_eng)
+                    break
+                current_output_idx += 1
+
+        actual_output_shape = tuple(context.get_tensor_shape(output_name))
+        output_elements = trt.volume(actual_output_shape)
+        output_dtype = trt.nptype(engine.get_tensor_dtype(output_name))
+
+        if output_elements == 0:
+            results[output_name] = np.empty(actual_output_shape, dtype=output_dtype)
+            continue
+
+        bytes_in_output = output_elements * np.dtype(output_dtype).itemsize
+
+        # Take the relevant slice from the host buffer
+        valid_host_data_slice = np.frombuffer(out_hd_mem.host.data[:bytes_in_output], dtype=output_dtype)
+        reshaped_output = valid_host_data_slice.reshape(actual_output_shape)
+        results[output_name] = reshaped_output.copy() # Copy to make it independent of buffer
+        logging.debug(f"Retrieved output '{output_name}' with shape {results[output_name].shape}")
+
+    return results
+
+def inverse_scale_predictions(scaled_preds: np.ndarray, ticker: str, feature: str, scalers: Dict[str, Dict[str, StandardScaler]]) -> Optional[np.ndarray]:
+    try:
+        if ticker in scalers and feature in scalers[ticker]:
+            scaler = scalers[ticker][feature]
+            # Scaler expects 2D array for transform/inverse_transform
+            preds_reshaped = scaled_preds.reshape(-1, 1)
+            orig_preds = scaler.inverse_transform(preds_reshaped)
+            return orig_preds.flatten() # Return 1D array
+        logging.warning(f"Scaler not found for {ticker}/{feature}. Returning scaled predictions.")
+        return scaled_preds # Return as is if no scaler
+    except Exception as e:
+        logging.error(f"Error inverse scaling {ticker}/{feature}: {e}", exc_info=True)
+        return None
+
+# --- START OF ADDED FUNCTION ---
+def save_predictions_to_csv(
+    tickers_list: List[str],
+    quantile_preds_scaled: np.ndarray,
+    scalers: Dict[str, Dict[str, StandardScaler]],
+    prediction_timestamp_ms: int,
+    quantiles: List[float],
+    target_feature: str,
+    out_csv_path: str = "predictions_log.csv",
+    *,
+    time_interval_val: int,
+    time_interval_unit: str,
+    pred_horizon_steps: int
+) -> None:
+    """
+    Append one batch of predictions to a CSV, including the *target* time.
+
+    New columns:
+        Target_Timestamp_ms, Target_Timestamp_Local
+    """
+    try:
+        # ---------- base & target timestamps ----------
+        eastern_tz = pytz.timezone(MARKET_TIMEZONE)  # already in your script
+        base_dt_utc   = pd.to_datetime(prediction_timestamp_ms, unit="ms", utc=True)
+        base_dt_local = base_dt_utc.tz_convert(eastern_tz)
+
+        # map unit → seconds
+        sec_per_bar = (
+            time_interval_val * 60 if time_interval_unit == "minute"
+            else time_interval_val * 3600 # Assuming 'hour' is the only other unit
+        )
+        offset_sec = sec_per_bar * pred_horizon_steps
+        target_dt_utc   = base_dt_utc + pd.Timedelta(seconds=offset_sec)
+        target_dt_local = target_dt_utc.tz_convert(eastern_tz)
+
+        # ---------- assemble rows ----------
+        rows: list[dict[str, Any]] = []
+        for i, ticker in enumerate(tickers_list):
+            q_scaled = quantile_preds_scaled[i, :]
+
+            # inverse‑scale each quantile
+            q_orig_vals: list[float] = []
+            for q_idx in range(len(quantiles)):
+                inv = inverse_scale_predictions(
+                    np.array([q_scaled[q_idx]]),
+                    ticker, target_feature, scalers
+                )
+                if inv is None:  # skip row on failure
+                    logging.warning(f"Failed to inverse scale prediction for {ticker}, quantile {quantiles[q_idx]}. Skipping row in CSV.")
+                    q_orig_vals = []
+                    break
+                q_orig_vals.append(float(inv[0]))
+            if not q_orig_vals:
+                continue # Skip this ticker if inverse scaling failed
+
+            row = {
+                "Timestamp_ms":   int(prediction_timestamp_ms),
+                "Timestamp_Local": base_dt_local.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "Target_Timestamp_ms": int(target_dt_utc.timestamp() * 1000),
+                "Target_Timestamp_Local": target_dt_local.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "Ticker": ticker,
+            }
+            for q, val in zip(quantiles, q_orig_vals):
+                row[f"Q_{q}"] = val
+            rows.append(row)
+
+        if not rows:
+            logging.warning("No valid rows produced after inverse scaling; nothing saved to CSV.")
+            return
+
+        df_out = pd.DataFrame(rows)
+        header_needed = not os.path.isfile(out_csv_path)
+        df_out.to_csv(out_csv_path, mode="a", header=header_needed, index=False)
+        logging.info(f"Saved {len(rows)} prediction rows to {out_csv_path}")
+
+    except Exception as e:
+        logging.error(f"Error saving predictions to CSV: {e}", exc_info=True)
+# --- END OF ADDED FUNCTION ---
+
+
+if __name__ == "__main__":
+    if not TRT_AVAILABLE:
+        logging.error("TensorRT or PyCUDA not installed. This script requires TensorRT for inference.")
+        exit(1)
+
+    logging.info("--- Starting Real-Time GNN Inference (TensorRT) ---")
+    logging.info(f"Tickers: {TICKERS_LIST}")
+    logging.info(f"Interval: {TIME_AGGREGATE} {TIME_UNIT}")
+    logging.info(f"Model Run Dir: {MODEL_RUN_DIR}")
+    logging.info(f"Sequence Length: {SEQ_LEN}, Prediction Horizon: {PRED_HORIZON}")
+    logging.info(f"Features: {FEATURES}, Target: {TARGET_FEATURE}")
+    logging.info(f"Expected GAT Heads: 1, Aggregation: mean")
+    logging.info(f"ONNX Opset: 16")
+
+    scalers = load_scalers(SCALER_FILE)
+    if scalers is None: exit(1)
+    missing_scalers_for_tickers = [t for t in TICKERS_LIST if t not in scalers]
+    if missing_scalers_for_tickers:
+        logging.error(f"Scalers missing for tickers: {missing_scalers_for_tickers}. Cannot proceed.")
+        exit(1)
+
+    best_params = load_best_params(BEST_PARAMS_FILE)
+    if best_params is None: exit(1)
+    if best_params.get('gat_heads', 1) != 1: # Default to 1 if key missing, but check
+        logging.warning(f"Loaded GAT heads from params is {best_params.get('gat_heads')}, but this script expects 1 for static ONNX/TRT.")
+        # exit(1) # Make this a warning for now, but it could be critical for model compatibility
+
+    if FORCE_REBUILD:
+        if ONNX_FILE_PATH.exists():
+            logging.info(f"Force rebuild: Deleting existing ONNX model: {ONNX_FILE_PATH}")
+            ONNX_FILE_PATH.unlink()
+        if TENSORRT_ENGINE_PATH.exists():
+            logging.info(f"Force rebuild: Deleting existing TensorRT engine: {TENSORRT_ENGINE_PATH}")
+            TENSORRT_ENGINE_PATH.unlink()
+
+    onnx_ok = build_onnx(MODEL_WEIGHTS_FILE, ONNX_FILE_PATH, best_params, len(FEATURES), EDGE_FEATURE_DIM, NUM_QUANTILES)
+    if not onnx_ok:
+        logging.error("Failed to build or obtain ONNX model. Exiting.")
+        exit(1)
+
+    engine_ok = build_engine(ONNX_FILE_PATH, TENSORRT_ENGINE_PATH, USE_FP16)
+    if not engine_ok:
+        logging.error("Failed to build TensorRT engine. Exiting.")
+        exit(1)
+
+    logging.info(f"Loading TensorRT engine from: {TENSORRT_ENGINE_PATH}")
+    runtime = trt.Runtime(TRT_LOGGER)
+    engine_deserialized = None
+    try:
+        with open(TENSORRT_ENGINE_PATH, "rb") as f:
+            engine_deserialized = runtime.deserialize_cuda_engine(f.read())
+    except Exception as e:
+        logging.error(f"Error deserializing TensorRT engine: {e}", exc_info=True)
+        exit(1)
+
+    if engine_deserialized is None:
+        logging.error("Failed to deserialize TensorRT engine (engine is None).")
+        exit(1)
+
+    # Use engine_deserialized for the rest of the script
+    trt_engine = engine_deserialized
+
+    context = trt_engine.create_execution_context()
+    if context is None:
+        logging.error("Failed to create TensorRT execution context.")
+        exit(1)
+
+    logging.info("Allocating Host/Device buffers...")
+    # Pass the deserialized engine to allocate_buffers
+    inputs_hd, outputs_hd, bindings_dev_ptrs, stream_cuda, binding_name_map = allocate_buffers(trt_engine)
+
+    if inputs_hd is None or outputs_hd is None : # Check if allocation failed
+        logging.error("Failed to allocate Host/Device buffers for TensorRT inference. Exiting.")
+        exit(1)
+    logging.info(f"Buffer allocation complete. Binding map: {binding_name_map}")
+
+    logging.info("--- Starting Inference Loop ---")
+    last_prediction_timestamp_ms = None
+
+    while True:
+        loop_start_time = time.time()
+        logging.info("Fetching latest market data...")
+
+        # Call fetch_latest_data without API_KEY
+        latest_data_df = fetch_latest_data(TICKERS_LIST, TIME_AGGREGATE, TIME_UNIT, SEQ_LEN)
+
+        if latest_data_df is None or latest_data_df.empty:
+            logging.warning(f"Failed to fetch data or data is empty. Retrying in {LOOP_INTERVAL_SECONDS}s...")
+            time.sleep(LOOP_INTERVAL_SECONDS) # Standard loop interval on fetch failure
+            continue
+
+        current_latest_ts_ms = latest_data_df.index[-1]
+        current_latest_dt_str = pd.to_datetime(current_latest_ts_ms, unit='ms', utc=True).tz_convert(MARKET_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S %Z')
+
+        if last_prediction_timestamp_ms is not None and current_latest_ts_ms <= last_prediction_timestamp_ms:
+            logging.info(f"Data timestamp {current_latest_dt_str} has not advanced past last prediction timestamp. Waiting for newer data...")
+            time.sleep(max(5, LOOP_INTERVAL_SECONDS // 10)) # Shorter sleep if data hasn't updated
+            continue
+
+        logging.info(f"Latest data timestamp: {current_latest_dt_str}")
+
+        # Ensure the fetched DataFrame has the correct number of tickers (nodes)
+        # The fetch_latest_data should ideally return None if not all tickers are present.
+        # However, double check here.
+        if len(latest_data_df.columns.levels[0]) != NUM_NODES:
+            logging.error(f"Fetched data contains {len(latest_data_df.columns.levels[0])} tickers, but expected {NUM_NODES}. Skipping this cycle.")
+            time.sleep(LOOP_INTERVAL_SECONDS)
+            continue
+
+
+        scaled_data_df = scale_realtime_data(latest_data_df, scalers, TICKERS_LIST, FEATURES)
+        if scaled_data_df is None:
+            logging.warning("Failed to scale data. Retrying in loop interval...")
+            time.sleep(LOOP_INTERVAL_SECONDS)
+            continue
+
+        x_list = []
+        # TICKERS_LIST is the canonical order
+        for ticker in TICKERS_LIST:
+            # Ensure ticker data exists in scaled_data_df and has correct features
+            if ticker in scaled_data_df.columns.get_level_values('Ticker'):
+                ticker_data = scaled_data_df[ticker].reindex(columns=FEATURES).values
+                if ticker_data.shape != (SEQ_LEN, len(FEATURES)):
+                    logging.error(f"Data for ticker {ticker} has unexpected shape {ticker_data.shape} after scaling/reindexing. Expected ({SEQ_LEN}, {len(FEATURES)}).")
+                    # This is a critical error, might need to abort or handle carefully
+                    break
+                x_list.append(ticker_data)
+            else:
+                logging.error(f"Ticker {ticker} is missing from scaled_data_df after data processing. This should not happen.")
+                # This is critical
+                break
+
+        if len(x_list) != NUM_NODES:
+            logging.error(f"Failed to prepare input features for all {NUM_NODES} nodes. Got data for {len(x_list)}. Skipping prediction.")
+            time.sleep(LOOP_INTERVAL_SECONDS)
+            continue
+
+        x_input_np = np.stack(x_list, axis=0).astype(np.float32) # Shape: (NUM_NODES, SEQ_LEN, NUM_FEATURES)
+
+        edge_index_torch, edge_attr_torch = compute_correlation_edges(x_input_np, CORR_THRESHOLD, TICKERS_LIST, FEATURES, TARGET_FEATURE)
+
+        edge_index_np_actual = edge_index_torch.numpy().astype(np.int64) # Shape (2, num_actual_edges)
+        edge_attr_np_actual = edge_attr_torch.numpy().astype(np.float32) # Shape (num_actual_edges, EDGE_FEATURE_DIM)
+        num_actual_edges = edge_index_np_actual.shape[1]
+
+        # Pad edges to MAX_EDGES for static ONNX/TRT model input shape
+        if MAX_EDGES > 0:
+            padded_edge_index = np.zeros((2, MAX_EDGES), dtype=np.int64)
+            padded_edge_attr = np.zeros((MAX_EDGES, EDGE_FEATURE_DIM), dtype=np.float32)
+
+            if num_actual_edges > 0:
+                if num_actual_edges <= MAX_EDGES:
+                    padded_edge_index[:, :num_actual_edges] = edge_index_np_actual
+                    padded_edge_attr[:num_actual_edges, :] = edge_attr_np_actual
+                else: # More actual edges than MAX_EDGES, truncate
+                    logging.warning(f"Number of actual edges ({num_actual_edges}) exceeds MAX_EDGES ({MAX_EDGES}). Truncating edges.")
+                    padded_edge_index = edge_index_np_actual[:, :MAX_EDGES]
+                    padded_edge_attr = edge_attr_np_actual[:MAX_EDGES, :]
+        else: # MAX_EDGES is 0 (e.g. NUM_NODES=1)
+             padded_edge_index = np.empty((2,0), dtype=np.int64)
+             padded_edge_attr = np.empty((0, EDGE_FEATURE_DIM), dtype=np.float32)
+
+
+        input_feed_dict = {
+            "node_features": x_input_np,
+            "edge_index": padded_edge_index,
+            "edge_attributes": padded_edge_attr
+        }
+        logging.debug(f"Input shapes to TRT: x={x_input_np.shape}, ei={padded_edge_index.shape}, ea={padded_edge_attr.shape}")
+
+        logging.debug("Running inference with TensorRT...")
+        inference_start_time = time.time()
+        # Pass deserialized engine (trt_engine) to predict_tensorrt
+        results_dict = predict_tensorrt(context, trt_engine, inputs_hd, outputs_hd, bindings_dev_ptrs, stream_cuda, binding_name_map, input_feed_dict)
+        inference_end_time = time.time()
+
+        if results_dict is None or "quantile_predictions" not in results_dict:
+            logging.error("Inference failed or 'quantile_predictions' missing in results.")
+            time.sleep(LOOP_INTERVAL_SECONDS) # Standard loop interval on inference failure
+            continue
+
+        logging.info(f"Inference successful ({inference_end_time - inference_start_time:.4f}s).")
+        last_prediction_timestamp_ms = current_latest_ts_ms # Update last prediction timestamp
+
+        scaled_predictions_np = results_dict["quantile_predictions"] # Shape: (NUM_NODES, NUM_QUANTILES)
+
+        if scaled_predictions_np is not None:
+            expected_pred_shape = (NUM_NODES, NUM_QUANTILES)
+            if scaled_predictions_np.shape != expected_pred_shape:
+                logging.error(f"Unexpected output prediction shape: {scaled_predictions_np.shape}, expected {expected_pred_shape}")
+            else:
+                print(f"\n--- Predictions (Original Scale) for {PRED_HORIZON}-step ahead ---")
+                print(f"Based on data up to: {current_latest_dt_str}")
+
+                # Time interval interpretation (assuming fixed from args)
+                time_interval_val = args.interval
+                time_interval_unit = args.unit
+                pred_horizon_minutes = PRED_HORIZON * (time_interval_val if time_interval_unit == "minute" else time_interval_val * 60)
+                print(f"Predicting for target time ~{pred_horizon_minutes} minutes from last data point.")
+
+                for i, ticker in enumerate(TICKERS_LIST): # Iterate in canonical order
+                    node_predictions_scaled_all_quantiles = scaled_predictions_np[i, :] # All quantiles for this node
+
+                    # Inverse scale each quantile prediction
+                    # Need to reshape for scaler: scaler expects (n_samples, n_features=1)
+                    # inverse_scale_predictions handles reshape and flatten
+
+                    median_pred_orig_str = "N/A"
+                    q_low_orig_str = "N/A"
+                    q_high_orig_str = "N/A"
+
+                    if MEDIAN_Q_IDX != -1: # If 0.5 quantile exists
+                        median_pred_scaled = np.array([node_predictions_scaled_all_quantiles[MEDIAN_Q_IDX]])
+                        median_pred_orig_val = inverse_scale_predictions(median_pred_scaled, ticker, TARGET_FEATURE, scalers)
+                        if median_pred_orig_val is not None:
+                            median_pred_orig_str = f"{median_pred_orig_val[0]:.3f}"
+
+                    # Assuming QUANTILES = [0.1, 0.5, 0.9] so indices 0 and 2 are low/high
+                    if len(QUANTILES) >= 3 and QUANTILES[0]==0.1 and QUANTILES[2]==0.9:
+                        q_low_scaled = np.array([node_predictions_scaled_all_quantiles[0]]) # Index for 0.1 quantile
+                        q_low_orig_val = inverse_scale_predictions(q_low_scaled, ticker, TARGET_FEATURE, scalers)
+                        if q_low_orig_val is not None:
+                             q_low_orig_str = f"{q_low_orig_val[0]:.3f}"
+
+                        q_high_scaled = np.array([node_predictions_scaled_all_quantiles[2]]) # Index for 0.9 quantile
+                        q_high_orig_val = inverse_scale_predictions(q_high_scaled, ticker, TARGET_FEATURE, scalers)
+                        if q_high_orig_val is not None:
+                            q_high_orig_str = f"{q_high_orig_val[0]:.3f}"
+
+                        print(f"  {ticker}: Median: {median_pred_orig_str} (Range: [{q_low_orig_str} - {q_high_orig_str}])")
+                    elif MEDIAN_Q_IDX != -1: # Only median is well-defined
+                        print(f"  {ticker}: Median: {median_pred_orig_str}")
+                    else: # Fallback if quantiles are not as expected
+                        raw_preds_str = ", ".join([f"{p:.3f}" for p in node_predictions_scaled_all_quantiles])
+                        print(f"  {ticker}: Scaled Preds (raw quantiles): {raw_preds_str} (Inverse scaling for specific quantiles not configured as expected)")
+
+                # --- Add the call to save predictions ---
+                save_predictions_to_csv(
+                    tickers_list=TICKERS_LIST,
+                    quantile_preds_scaled=scaled_predictions_np,
+                    scalers=scalers,
+                    prediction_timestamp_ms=current_latest_ts_ms,
+                    quantiles=QUANTILES,
+                    target_feature=TARGET_FEATURE,
+                    # out_csv_path="predictions_log.csv", # Use default from function definition
+                    time_interval_val=args.interval,
+                    time_interval_unit=args.unit,
+                    pred_horizon_steps=PRED_HORIZON
+                )
+                # --- End of added call ---
+
+                print("-" * 35)
+        else:
+            logging.warning("Inference result 'quantile_predictions' was None.")
+
+        loop_end_time = time.time()
+        processing_time_seconds = loop_end_time - loop_start_time
+        sleep_duration_seconds = max(0, LOOP_INTERVAL_SECONDS - processing_time_seconds)
+
+        logging.info(f"Loop processing time: {processing_time_seconds:.2f}s. Sleeping for {sleep_duration_seconds:.2f}s...")
+        time.sleep(sleep_duration_seconds)
+
+# --- END OF FILE PRED_RT.py ---
